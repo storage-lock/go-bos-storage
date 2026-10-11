@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/baidubce/bce-sdk-go/bce"
+	bce_http "github.com/baidubce/bce-sdk-go/http"
 	"github.com/baidubce/bce-sdk-go/services/bos"
 	"github.com/baidubce/bce-sdk-go/services/bos/api"
 	go_iterator "github.com/golang-infrastructure/go-iterator"
@@ -16,6 +18,25 @@ import (
 )
 
 const bosValueSeparator = "\x00"
+
+// 对象操作默认走真实客户端。SDK 方法是值接收者且响应体未导出，测试通过替换这些函数覆盖分支。
+var (
+	bosSendRequest = func(client *bos.Client, req *bce.BceRequest, resp *bce.BceResponse) error {
+		return client.SendRequest(req, resp)
+	}
+	bosGetObject = func(client *bos.Client, bucket, key string) (*api.GetObjectResult, error) {
+		return client.GetObject(bucket, key, nil)
+	}
+	bosPutObjectFromBytes = func(client *bos.Client, bucket, key string, value []byte) (string, error) {
+		return client.PutObjectFromBytes(bucket, key, value, nil)
+	}
+	bosDeleteObject = func(client *bos.Client, bucket, key string) error {
+		return client.DeleteObject(bucket, key)
+	}
+	bosListObjects = func(client *bos.Client, bucket string, args *api.ListObjectsArgs) (*api.ListObjectsResult, error) {
+		return client.ListObjects(bucket, args)
+	}
+)
 
 // BOSStorage 基于百度云 BOS 的存储引擎实现
 type BOSStorage struct {
@@ -44,10 +65,20 @@ func (x *BOSStorage) GetName() string {
 }
 
 func (x *BOSStorage) Capabilities() []storage.StorageCapability {
+	// 注意：BOS 只满足部分 CAS：
+	//   - CreateWithVersion 原子（x-bce-forbid-overwrite 服务端防覆盖）
+	//   - UpdateWithVersion/DeleteWithVersion 非原子（BOS SDK 的 PutObject 未暴露
+	//     If-Match 条件写，只能 Get-then-Put，并发下互斥性无保障）
+	// 因此不声明 CapabilityCAS，避免框架误以为可用于生产分布式锁；
+	// 也不声明 CapabilityAtomicDelete，释放只能走非原子删除。
 	return []storage.StorageCapability{
-		storage.CapabilityCAS,
 		storage.CapabilityReliableTime,
+		storage.CapabilityWatch,
 	}
+}
+
+func (x *BOSStorage) Watch(ctx context.Context, lockId string) (<-chan *storage.LockInformation, error) {
+	return storage.NewPollingLockWatcher(x, 500*time.Millisecond).Watch(ctx, lockId)
 }
 
 func (x *BOSStorage) Init(ctx context.Context) error {
@@ -91,18 +122,35 @@ func bosDecodeValue(data []byte) (storage.Version, string, error) {
 	return storage.Version(version), parts[1], nil
 }
 
-// CreateWithVersion 条件创建
+// CreateWithVersion 条件创建：BOS 原生支持 x-bce-forbid-overwrite 防覆盖语义，
+// 该头部由服务端原子执行，满足 CAS 要求
 func (x *BOSStorage) CreateWithVersion(ctx context.Context, lockId string, version storage.Version, lockInformation *storage.LockInformation) error {
 	key := x.objectKey(lockId)
 	value := bosEncodeValue(version, lockInformation.ToJsonString())
 
-	_, err := x.client.PutObjectFromBytes(x.options.BucketName, key, value, nil)
-	if err != nil {
+	// 使用 x-bce-forbid-overwrite=true：对象已存在时服务端原子拒绝，保证 Create 的原子性。
+	// NewBodyFromBytes 只对内存字节计算 MD5，不会失败。
+	body, _ := bce.NewBodyFromBytes(value)
+	req := &bce.BceRequest{}
+	req.SetUri(fmt.Sprintf("/%s/%s", x.options.BucketName, key))
+	req.SetMethod("PUT")
+	req.SetBody(body)
+	req.SetHeader(bce_http.BCE_FORBID_OVERWRITE, "true")
+	resp := &bce.BceResponse{}
+	if err := bosSendRequest(x.client, req, resp); err != nil {
 		if isBosPreconditionError(err) {
 			return storage_lock.ErrVersionMiss
 		}
 		return err
 	}
+	if resp.IsFail() {
+		err := resp.ServiceError()
+		if isBosPreconditionError(err) {
+			return storage_lock.ErrVersionMiss
+		}
+		return err
+	}
+	defer func() { resp.Body().Close() }()
 	return nil
 }
 
@@ -110,10 +158,11 @@ func (x *BOSStorage) CreateWithVersion(ctx context.Context, lockId string, versi
 func (x *BOSStorage) UpdateWithVersion(ctx context.Context, lockId string, expectedVersion, newVersion storage.Version, lockInformation *storage.LockInformation) error {
 	key := x.objectKey(lockId)
 
-	result, err := x.client.GetObject(x.options.BucketName, key, nil)
+	result, err := bosGetObject(x.client, x.options.BucketName, key)
 	if err != nil {
 		if isBosNotFoundError(err) {
-			return storage_lock.ErrLockNotFound
+			// 记录不存在返回 ErrVersionMiss（可重试），对齐 S3 基类/memory 已修口径。
+			return storage_lock.ErrVersionMiss
 		}
 		return err
 	}
@@ -132,7 +181,7 @@ func (x *BOSStorage) UpdateWithVersion(ctx context.Context, lockId string, expec
 	}
 
 	newValue := bosEncodeValue(newVersion, lockInformation.ToJsonString())
-	_, err = x.client.PutObjectFromBytes(x.options.BucketName, key, newValue, nil)
+	_, err = bosPutObjectFromBytes(x.client, x.options.BucketName, key, newValue)
 	if err != nil {
 		if isBosPreconditionError(err) {
 			return storage_lock.ErrVersionMiss
@@ -146,7 +195,7 @@ func (x *BOSStorage) UpdateWithVersion(ctx context.Context, lockId string, expec
 func (x *BOSStorage) DeleteWithVersion(ctx context.Context, lockId string, expectedVersion storage.Version, lockInformation *storage.LockInformation) error {
 	key := x.objectKey(lockId)
 
-	result, err := x.client.GetObject(x.options.BucketName, key, nil)
+	result, err := bosGetObject(x.client, x.options.BucketName, key)
 	if err != nil {
 		if isBosNotFoundError(err) {
 			return storage_lock.ErrLockNotFound
@@ -167,13 +216,13 @@ func (x *BOSStorage) DeleteWithVersion(ctx context.Context, lockId string, expec
 		return storage_lock.ErrVersionMiss
 	}
 
-	err = x.client.DeleteObject(x.options.BucketName, key)
+	err = bosDeleteObject(x.client, x.options.BucketName, key)
 	return err
 }
 
 func (x *BOSStorage) Get(ctx context.Context, lockId string) (string, error) {
 	key := x.objectKey(lockId)
-	result, err := x.client.GetObject(x.options.BucketName, key, nil)
+	result, err := bosGetObject(x.client, x.options.BucketName, key)
 	if err != nil {
 		if isBosNotFoundError(err) {
 			return "", storage_lock.ErrLockNotFound
@@ -210,7 +259,7 @@ func (x *BOSStorage) List(ctx context.Context) (go_iterator.Iterator[*storage.Lo
 
 	marker := ""
 	for {
-		result, err := x.client.ListObjects(x.options.BucketName, &api.ListObjectsArgs{
+		result, err := bosListObjects(x.client, x.options.BucketName, &api.ListObjectsArgs{
 			Prefix:  prefix,
 			Marker:  marker,
 			MaxKeys: 1000,
@@ -220,7 +269,7 @@ func (x *BOSStorage) List(ctx context.Context) (go_iterator.Iterator[*storage.Lo
 		}
 
 		for _, obj := range result.Contents {
-			getResult, err := x.client.GetObject(x.options.BucketName, obj.Key, nil)
+			getResult, err := bosGetObject(x.client, x.options.BucketName, obj.Key)
 			if err != nil {
 				continue
 			}

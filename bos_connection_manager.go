@@ -27,6 +27,9 @@ type BOSConnectionManager struct {
 var _ storage.ConnectionManager[*bos.Client] = &BOSConnectionManager{}
 
 // NewBOSConnectionManagerFromConfig 从配置创建
+// bosNewClient 默认创建真实客户端，测试可替换。
+var bosNewClient = bos.NewClient
+
 func NewBOSConnectionManagerFromConfig(accessKeyID, secretAccessKey, endpoint, bucketName string) *BOSConnectionManager {
 	return &BOSConnectionManager{
 		AccessKeyID:     accessKeyID,
@@ -57,7 +60,7 @@ func (x *BOSConnectionManager) Take(ctx context.Context) (*bos.Client, error) {
 		return x.client, nil
 	}
 
-	client, err := bos.NewClient(x.AccessKeyID, x.SecretAccessKey, x.Endpoint)
+	client, err := bosNewClient(x.AccessKeyID, x.SecretAccessKey, x.Endpoint)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create BOS client: %w", err)
 	}
